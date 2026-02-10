@@ -1,10 +1,21 @@
 package mr
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
+	"io/fs"
 	"log"
 	"net/rpc"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -21,9 +32,31 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+type TaskStatus string
+
+const (
+	done    TaskStatus = "done"
+	failed  TaskStatus = "failer"
+	running TaskStatus = "running"
+)
+
+type MyTask struct {
+	taskType  Task
+	filename  string
+	reduceNum int
+
+	mapTaskID    int
+	reduceTaskID int
+
+	status TaskStatus
+}
+
 type IAmWorker struct {
 	id int
 	c  *rpc.Client
+
+	mapf    func(string, string) []KeyValue
+	reducef func(string, []string) string
 }
 
 func makeClient(serverAddr string, port string) *rpc.Client {
@@ -47,7 +80,7 @@ func (w *IAmWorker) call(rpcname string, args any, reply any) error {
 }
 
 // SayHello reisters worker in coordinator
-func (w *IAmWorker) SayHello() error {
+func (w *IAmWorker) sayHello() error {
 	args := EmptyArgs{}
 
 	reply := HelloReply{}
@@ -60,6 +93,232 @@ func (w *IAmWorker) SayHello() error {
 	return nil
 }
 
+// StartWorking gets task from coordinator and manages it
+func (w *IAmWorker) startWorking() error {
+	const maxRPCFails = 7
+	fails := 0
+
+	for {
+		task, err := w.requestTask()
+		if err != nil {
+			fails++
+			if fails >= maxRPCFails {
+				return err
+			}
+			time.Sleep(time.Second)
+			continue
+		}
+		task.status = running
+
+		switch task.taskType {
+		case Map:
+			err = w.doMap(task.mapTaskID, task.filename, task.reduceNum)
+		case Reduce:
+			err = w.doReduce(task.reduceTaskID)
+		case Wait:
+			time.Sleep(1 * time.Second)
+		case Exit:
+			fmt.Printf("worker- %d exited", w.id)
+			return nil
+		}
+
+		if err != nil {
+			_ = w.reportTask(task, failed)
+			fmt.Printf("worker- %d failed:  %v", w.id, err)
+		}
+		err = w.reportTask(task, done)
+		if err != nil {
+			fmt.Printf("worker- %d failed:  %v", w.id, err)
+		}
+	}
+}
+
+// reportTask reports to coordinator final status of task
+// if fails worker will wait for next task and coordinator will set failed in 10 seconds timeout
+func (w *IAmWorker) reportTask(task MyTask, status TaskStatus) error {
+	taskID, err := func() (int, error) {
+		switch task.taskType {
+		case Map:
+			return task.mapTaskID, nil
+		case Reduce:
+			return task.reduceTaskID, nil
+		}
+		return -1, errors.New("undefined type: " + string(task.taskType))
+	}()
+	if err != nil {
+		return err
+	}
+
+	args := ReportArgs{
+		Type:   task.taskType,
+		TaskID: taskID,
+		Status: status,
+	}
+	reply := ReportReply{}
+
+	err = w.call("Coordinator.ReceiveReport", &args, &reply)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+var endNumRe = regexp.MustCompile(`\d+$`)
+
+func endNumber(filename string) (int, bool) {
+	base := filepath.Base(filename)
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	s := endNumRe.FindString(name)
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+func (w *IAmWorker) doReduce(reduceTaskID int) error {
+	values := make([]KeyValue, 0)
+
+	root := "."
+	// go through all files in root
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		// check for temp file type
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		n, ok := endNumber(d.Name())
+		if !ok || n != reduceTaskID {
+			return nil
+		}
+
+		// Read temp file from map task
+		// TODO: возможно проблема что при ошибке файлы будут оставаться и при переделке задачи будут проблемы
+		f, err := os.Open(d.Name())
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		dec := json.NewDecoder(f)
+		for {
+			var kv KeyValue
+			err = dec.Decode(&kv)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			values = append(values, kv)
+		}
+
+		outFName := fmt.Sprintf("mr-out-%d", reduceTaskID)
+		ofile, err := os.Create(outFName)
+		if err != nil {
+			return err
+		}
+
+		sort.Sort(ByKey(values))
+
+		// call Reduce on each distinct key in values[],
+		// and print the result to mr-out-0.
+		i := 0
+		for i < len(values) {
+			j := i + 1
+
+			for j < len(values) && values[j].Key == values[i].Key {
+				j++
+			}
+			final := []string{}
+			for k := i; k < j; k++ {
+				final = append(final, values[k].Value)
+			}
+			output := w.reducef(values[i].Key, final)
+
+			fmt.Fprintf(ofile, "%v %v\n", values[i].Key, output)
+
+			i = j
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *IAmWorker) doMap(taskID int, filename string, reduceNum int) error {
+	// read file
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return err
+	}
+	file.Close()
+	kva := w.mapf(filename, string(content))
+
+	// split on map temp files
+	files := make([]*os.File, reduceNum)
+	encoders := make([]*json.Encoder, reduceNum)
+
+	for _, kv := range kva {
+		n := ihash(kv.Key) % reduceNum
+
+		tempName := fmt.Sprintf("out-%d-%d", taskID, n)
+		f, err := os.Create(tempName)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		if files[n] == nil {
+			files[n] = f
+		}
+		if encoders[n] == nil {
+			encoders[n] = json.NewEncoder(f)
+		}
+		err = encoders[n].Encode(&kv)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// requestTask asks for task from coordinator
+func (w *IAmWorker) requestTask() (MyTask, error) {
+	args := TaskArgs{
+		ID: w.id,
+	}
+	reply := TaskReply{}
+
+	err := w.call("Coordinator.GiveTask", &args, &reply)
+	if err != nil {
+		return MyTask{}, err
+	}
+	return MyTask{
+		taskType:     reply.Type,
+		filename:     reply.Filename,
+		reduceNum:    reply.ReduceNum,
+		mapTaskID:    reply.MapTaskID,
+		reduceTaskID: reply.ReduceTaskID,
+	}, nil
+}
+
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string,
@@ -67,12 +326,20 @@ func Worker(mapf func(string, string) []KeyValue,
 	worker := IAmWorker{}
 	worker.c = makeClient("127.0.0.1", "1234")
 
-	err := worker.SayHello()
+	err := worker.sayHello()
 	if err != nil {
 		log.Fatal("couldn't get id:", err)
 	}
 
-	fmt.Println(worker.id)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- worker.startWorking()
+		close(errCh)
+	}()
+
+	if err := <-errCh; err != nil {
+		log.Fatal("coordinator dead")
+	}
 
 	// Your worker implementation here.
 
