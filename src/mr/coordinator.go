@@ -6,9 +6,11 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
+	"sync"
 )
 
 type Coordinator struct {
+	mu      sync.RWMutex
 	workers []ActiveWorker
 	// Your definitions here.
 }
@@ -22,11 +24,15 @@ type ActiveWorker struct {
 // Hello is rpc method
 // returns registered worker id
 func (c *Coordinator) Hello(args *EmptyArgs, reply *HelloReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	nextID := len(c.workers)
 	worker := ActiveWorker{
 		id: nextID,
 	}
 	c.workers = append(c.workers, worker)
+
 	reply.ID = nextID
 	fmt.Println("registered", c.workers)
 	return nil
@@ -57,7 +63,10 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
+	c := Coordinator{
+		mu:      sync.RWMutex{},
+		workers: make([]ActiveWorker, 0),
+	}
 
 	// Your code here.
 
