@@ -35,3 +35,34 @@ type EmptyArgs struct{}
 type HelloReply struct {
 	ID int
 }
+
+type Task string
+
+const (
+	Map    Task = "map"
+	Reduce Task = "reduce"
+	Wait   Task = "wait"
+	Exit   Task = "exit"
+)
+
+type TaskArgs struct {
+	ID int
+}
+
+type TaskReply struct {
+	Type      Task
+	Filename  string
+	ReduceNum int
+
+	MapTaskID    int
+	ReduceTaskID int
+}
+
+type ReportArgs struct {
+	Type   Task
+	TaskID int
+	Status TaskStatus
+}
+
+type ReportReply struct {
+}
