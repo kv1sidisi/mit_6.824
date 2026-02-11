@@ -56,7 +56,7 @@ const maxRetries = 5
 
 type Coordinator struct {
 	mu      sync.RWMutex
-	workers []ActiveWorker
+	workers map[int]*ActiveWorker
 	reduceN int
 	phase   CoordinatorPhase
 
@@ -81,10 +81,11 @@ func (c *Coordinator) Hello(args *EmptyArgs, reply *HelloReply) error {
 	defer c.mu.Unlock()
 
 	nextID := len(c.workers)
-	worker := ActiveWorker{
+	worker := &ActiveWorker{
 		id: nextID,
 	}
-	c.workers = append(c.workers, worker)
+
+	c.workers[nextID] = worker
 
 	reply.ID = nextID
 	fmt.Println("registered", c.workers)
@@ -94,6 +95,7 @@ func (c *Coordinator) Hello(args *EmptyArgs, reply *HelloReply) error {
 // GiveTask is rpc method
 // returns task for worker
 func (c *Coordinator) GiveTask(args *TaskArgs, reply *TaskReply) error {
+	wId := args.ID
 
 }
 

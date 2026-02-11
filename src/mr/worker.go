@@ -40,7 +40,7 @@ const (
 	running TaskStatus = "running"
 )
 
-type MyTask struct {
+type WorkerTask struct {
 	taskType  Task
 	filename  string
 	reduceNum int
@@ -135,7 +135,7 @@ func (w *IAmWorker) startWorking() error {
 
 // reportTask reports to coordinator final status of task
 // if fails worker will wait for next task and coordinator will set failed in 10 seconds timeout
-func (w *IAmWorker) reportTask(task MyTask, status TaskStatus) error {
+func (w *IAmWorker) reportTask(task WorkerTask, status TaskStatus) error {
 	taskID, err := func() (int, error) {
 		switch task.taskType {
 		case Map:
@@ -300,7 +300,7 @@ func (w *IAmWorker) doMap(taskID int, filename string, reduceNum int) error {
 }
 
 // requestTask asks for task from coordinator
-func (w *IAmWorker) requestTask() (MyTask, error) {
+func (w *IAmWorker) requestTask() (WorkerTask, error) {
 	args := TaskArgs{
 		ID: w.id,
 	}
@@ -308,9 +308,9 @@ func (w *IAmWorker) requestTask() (MyTask, error) {
 
 	err := w.call("Coordinator.GiveTask", &args, &reply)
 	if err != nil {
-		return MyTask{}, err
+		return WorkerTask{}, err
 	}
-	return MyTask{
+	return WorkerTask{
 		taskType:     reply.Type,
 		filename:     reply.Filename,
 		reduceNum:    reply.ReduceNum,
