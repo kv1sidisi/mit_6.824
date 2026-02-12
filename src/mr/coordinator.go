@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -9,94 +8,75 @@ import (
 	"sync"
 )
 
-type CoordinatorPhase string
-
-const (
-	mapPhase    CoordinatorPhase = "mapPhase"
-	reducePhase CoordinatorPhase = "reducePhase"
-	donePhase   CoordinatorPhase = "donePhase"
-)
-
-type TaskType string
-
-const (
-	mapType    TaskType = "mapType"
-	reduceType TaskType = "reduceType"
-)
-
-type TaskMeta struct {
-	taskType     TaskType
-	iD           int
-	filename     string
-	retriedTimes int
-}
-
-type Queue struct {
-	data []*TaskMeta
-}
-
-func (q *Queue) Enqueue(v *TaskMeta) {
-	q.data = append(q.data, v)
-}
-
-func (q *Queue) Dequeue() (*TaskMeta, bool) {
-	if len(q.data) == 0 {
-		return nil, false
-	}
-	v := q.data[0]
-	q.data = q.data[1:]
-	return v, true
-}
-
-func (q *Queue) IsEmpty() bool {
-	return len(q.data) == 0
-}
-
-const maxRetries = 5
-
-type Coordinator struct {
-	mu      sync.RWMutex
-	workers map[int]*ActiveWorker
-	reduceN int
-	phase   CoordinatorPhase
-
-	mapQ    Queue
-	reduceQ Queue
-
-	mapTaskByID    map[int]*TaskMeta
-	reduceTaskByID map[int]*TaskMeta
-
-	retryQ     Queue
-	maxRetries int
-}
-
-type ActiveWorker struct {
-	id int
-}
-
-// Hello is rpc method
-// returns registered worker id
-func (c *Coordinator) Hello(args *EmptyArgs, reply *HelloReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	nextID := len(c.workers)
-	worker := &ActiveWorker{
-		id: nextID,
-	}
-
-	c.workers[nextID] = worker
-
-	reply.ID = nextID
-	fmt.Println("registered", c.workers)
-	return nil
-}
-
 // GiveTask is rpc method
 // returns task for worker
 func (c *Coordinator) GiveTask(args *TaskArgs, reply *TaskReply) error {
-	wId := args.ID
+	var task *TaskMeta
+	var ok bool
 
+	// get task
+	switch c.phase {
+	case mapPhase:
+		if !c.retryQ.IsEmpty() {
+			task, ok = c.mapQ.Dequeue()
+		} else {
+			task, ok = c.retryQ.Dequeue()
+		}
+	case reducePhase:
+		if !c.retryQ.IsEmpty() {
+			task, ok = c.reduceQ.Dequeue()
+		} else {
+			task, ok = c.retryQ.Dequeue()
+		}
+	case donePhase:
+		reply.Type = Exit
+		return nil
+	}
+
+	// write task data to reply
+	if !ok {
+		reply.Type = Wait
+		return nil
+	}
+
+	// TODO: could be removed if we fight for task til end
+	if task.retriedTimes == c.maxRetries {
+		reply.Type = Wait
+		return nil
+	}
+
+	if task.taskType == mapType {
+		reply.Type = Map
+		reply.MapTaskID = task.iD
+		reply.Filename = task.filename
+	} else {
+		reply.Type = Reduce
+		reply.ReduceTaskID = task.iD
+	}
+
+	reply.ReduceNum = c.reduceN
+
+	return nil
+}
+
+func (c *Coordinator) ReceiveReport(args *ReportArgs, reply *ReportReply) error {
+	id := args.TaskID
+	taskType := args.Type
+	status := args.Status
+
+	var task *TaskMeta
+
+	switch taskType {
+	case Map:
+		task = c.mapTaskByID[id]
+	case Reduce:
+		task = c.reduceTaskByID[id]
+	}
+	if status == failed {
+		task.retriedTimes++
+		c.retryQ.Enqueue(task)
+	}
+	return nil
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -115,8 +95,6 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 	ret := false
 
-	// Your code here.
-
 	return ret
 }
 
@@ -126,7 +104,7 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		mu:         sync.RWMutex{},
-		workers:    make([]ActiveWorker, 0),
+		workers:    make(map[int]*ActiveWorker),
 		reduceN:    nReduce,
 		phase:      mapPhase,
 		maxRetries: maxRetries,
@@ -143,13 +121,15 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.mapTaskByID = mapTaskByID
 	c.reduceTaskByID = reduceTaskByID
 
+	c.tasksNum = len(files) + nReduce
+
 	c.server()
 	return &c
 }
 
 func makeMapTasks(files []string) ([]*TaskMeta, map[int]*TaskMeta) {
 	mapTasks := make([]*TaskMeta, len(files))
-	TaskById := make(map[int]*TaskMeta)
+	TaskByID := make(map[int]*TaskMeta)
 
 	for i, v := range files {
 		task := &TaskMeta{
@@ -158,24 +138,24 @@ func makeMapTasks(files []string) ([]*TaskMeta, map[int]*TaskMeta) {
 			filename: v,
 		}
 		mapTasks = append(mapTasks, task)
-		TaskById[i] = task
+		TaskByID[i] = task
 	}
 
-	return mapTasks, TaskById
+	return mapTasks, TaskByID
 }
 
 func makeReduceTasks(reduceN int) ([]*TaskMeta, map[int]*TaskMeta) {
 	reduceTasks := make([]*TaskMeta, reduceN)
-	TaskById := make(map[int]*TaskMeta)
+	TaskByID := make(map[int]*TaskMeta)
 
-	for i := 0; i < reduceN; i++ {
+	for i := range reduceN {
 		task := &TaskMeta{
 			taskType: reduceType,
 			iD:       i,
 		}
 		reduceTasks = append(reduceTasks, task)
-		TaskById[i] = task
+		TaskByID[i] = task
 	}
 
-	return reduceTasks, TaskById
+	return reduceTasks, TaskByID
 }

@@ -36,31 +36,34 @@ type HelloReply struct {
 	ID int
 }
 
-type Task string
+type WorkerTask string
 
 const (
-	Map    Task = "map"
-	Reduce Task = "reduce"
-	Wait   Task = "wait"
-	Exit   Task = "exit"
+	Map    WorkerTask = "map"
+	Reduce WorkerTask = "reduce"
+	Wait   WorkerTask = "wait"
 )
 
-type TaskArgs struct {
-	ID int
+type GetTaskArgs struct {
+	WiD int
 }
 
-type TaskReply struct {
-	Type      Task
-	Filename  string
-	ReduceNum int
-
-	MapTaskID    int
-	ReduceTaskID int
+type GetTaskReply struct {
+	TiD      int
+	WTask    WorkerTask
+	Filename string
+	NReduce  int
 }
+
+type TaskStatus string
+
+const (
+	done   TaskStatus = "done"
+	failed TaskStatus = "failer"
+)
 
 type ReportArgs struct {
-	Type   Task
-	TaskID int
+	WiD    int
 	Status TaskStatus
 }
 

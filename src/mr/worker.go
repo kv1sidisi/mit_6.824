@@ -32,16 +32,7 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-type TaskStatus string
-
-const (
-	done    TaskStatus = "done"
-	failed  TaskStatus = "failer"
-	running TaskStatus = "running"
-)
-
 type WorkerTask struct {
-	taskType  Task
 	filename  string
 	reduceNum int
 
