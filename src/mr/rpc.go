@@ -1,5 +1,7 @@
 package mr
 
+import "errors"
+
 //
 // RPC definitions.
 //
@@ -39,9 +41,15 @@ type HelloReply struct {
 type WorkerTask string
 
 const (
-	Map    WorkerTask = "map"
-	Reduce WorkerTask = "reduce"
-	Wait   WorkerTask = "wait"
+	Run  WorkerTask = "done"
+	Wait WorkerTask = "wait"
+)
+
+type TaskType string
+
+const (
+	MapType    TaskType = "map"
+	ReduceType TaskType = "reduce"
 )
 
 type GetTaskArgs struct {
@@ -51,20 +59,23 @@ type GetTaskArgs struct {
 type GetTaskReply struct {
 	TiD      int
 	WTask    WorkerTask
+	TType    TaskType
 	Filename string
 	NReduce  int
 }
 
-type TaskStatus string
+var ErrorTaskType error = errors.New("error getting task type")
+
+type WorkerReport string
 
 const (
-	done   TaskStatus = "done"
-	failed TaskStatus = "failer"
+	WSuccess WorkerReport = "workerSuccess"
+	WFailed  WorkerReport = "workerFailed"
 )
 
 type ReportArgs struct {
 	WiD    int
-	Status TaskStatus
+	Status WorkerReport
 }
 
 type ReportReply struct {

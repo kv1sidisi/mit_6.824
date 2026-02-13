@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net/rpc"
 	"os"
 	"path/filepath"
@@ -18,33 +18,18 @@ import (
 	"time"
 )
 
-// Map functions return a slice of KeyValue.
-type KeyValue struct {
-	Key   string
-	Value string
-}
-
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-func ihash(key string) int {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return int(h.Sum32() & 0x7fffffff)
-}
-
-type WorkerTask struct {
-	filename  string
-	reduceNum int
-
-	mapTaskID    int
-	reduceTaskID int
-
-	status TaskStatus
+type WTask struct {
+	iD       int
+	taskType TaskType
+	filename string
+	nReduce  int
 }
 
 type IAmWorker struct {
-	id int
+	iD int
 	c  *rpc.Client
+
+	task WorkerTask
 
 	mapf    func(string, string) []KeyValue
 	reducef func(string, []string) string
@@ -80,7 +65,7 @@ func (w *IAmWorker) sayHello() error {
 	if err != nil {
 		return err
 	}
-	w.id = reply.ID
+	w.iD = reply.ID
 	return nil
 }
 
@@ -99,60 +84,34 @@ func (w *IAmWorker) startWorking() error {
 			time.Sleep(time.Second)
 			continue
 		}
-		task.status = running
+
+		if w.task == Wait {
+			time.Sleep(time.Second)
+			continue
+		}
 
 		switch task.taskType {
-		case Map:
-			err = w.doMap(task.mapTaskID, task.filename, task.reduceNum)
-		case Reduce:
-			err = w.doReduce(task.reduceTaskID)
-		case Wait:
-			time.Sleep(1 * time.Second)
-		case Exit:
-			fmt.Printf("worker- %d exited", w.id)
-			return nil
+		case MapType:
+			err = w.doMap(task.iD, task.filename, task.nReduce)
+		case ReduceType:
+			err = w.doReduce(task.iD)
 		}
 
 		if err != nil {
-			_ = w.reportTask(task, failed)
-			fmt.Printf("worker- %d failed:  %v", w.id, err)
+			_ = w.reportTask(WFailed)
+			slog.Debug("worker failed",
+				slog.Int("id", w.iD),
+				slog.Any("err", err),
+			)
 		}
-		err = w.reportTask(task, done)
+		err = w.reportTask(WSuccess)
 		if err != nil {
-			fmt.Printf("worker- %d failed:  %v", w.id, err)
+			slog.Debug("worker failed",
+				slog.Int("id", w.iD),
+				slog.Any("err", err),
+			)
 		}
 	}
-}
-
-// reportTask reports to coordinator final status of task
-// if fails worker will wait for next task and coordinator will set failed in 10 seconds timeout
-func (w *IAmWorker) reportTask(task WorkerTask, status TaskStatus) error {
-	taskID, err := func() (int, error) {
-		switch task.taskType {
-		case Map:
-			return task.mapTaskID, nil
-		case Reduce:
-			return task.reduceTaskID, nil
-		}
-		return -1, errors.New("undefined type: " + string(task.taskType))
-	}()
-	if err != nil {
-		return err
-	}
-
-	args := ReportArgs{
-		Type:   task.taskType,
-		TaskID: taskID,
-		Status: status,
-	}
-	reply := ReportReply{}
-
-	err = w.call("Coordinator.ReceiveReport", &args, &reply)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 var endNumRe = regexp.MustCompile(`\d+$`)
@@ -170,12 +129,6 @@ func endNumber(filename string) (int, bool) {
 	}
 	return n, true
 }
-
-type ByKey []KeyValue
-
-func (a ByKey) Len() int           { return len(a) }
-func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 func (w *IAmWorker) doReduce(reduceTaskID int) error {
 	values := make([]KeyValue, 0)
@@ -260,6 +213,9 @@ func (w *IAmWorker) doMap(taskID int, filename string, reduceNum int) error {
 		return err
 	}
 	file.Close()
+	if w == nil || w.mapf == nil {
+		return errors.New("worker/mapf is nil")
+	}
 	kva := w.mapf(filename, string(content))
 
 	// split on map temp files
@@ -270,18 +226,18 @@ func (w *IAmWorker) doMap(taskID int, filename string, reduceNum int) error {
 		n := ihash(kv.Key) % reduceNum
 
 		tempName := fmt.Sprintf("out-%d-%d", taskID, n)
-		f, err := os.Create(tempName)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-
 		if files[n] == nil {
+			f, err := os.Create(tempName)
+			if err != nil {
+				return err
+			}
 			files[n] = f
+			if encoders[n] == nil {
+				encoders[n] = json.NewEncoder(f)
+			}
+			defer f.Close()
 		}
-		if encoders[n] == nil {
-			encoders[n] = json.NewEncoder(f)
-		}
+
 		err = encoders[n].Encode(&kv)
 		if err != nil {
 			return err
@@ -291,23 +247,43 @@ func (w *IAmWorker) doMap(taskID int, filename string, reduceNum int) error {
 }
 
 // requestTask asks for task from coordinator
-func (w *IAmWorker) requestTask() (WorkerTask, error) {
-	args := TaskArgs{
-		ID: w.id,
+func (w *IAmWorker) requestTask() (WTask, error) {
+	args := GetTaskArgs{
+		WiD: w.iD,
 	}
-	reply := TaskReply{}
+	reply := GetTaskReply{}
 
 	err := w.call("Coordinator.GiveTask", &args, &reply)
 	if err != nil {
-		return WorkerTask{}, err
+		return WTask{}, err
 	}
-	return WorkerTask{
-		taskType:     reply.Type,
-		filename:     reply.Filename,
-		reduceNum:    reply.ReduceNum,
-		mapTaskID:    reply.MapTaskID,
-		reduceTaskID: reply.ReduceTaskID,
+
+	w.task = reply.WTask
+
+	return WTask{
+		iD:       reply.TiD,
+		taskType: reply.TType,
+		filename: reply.Filename,
+		nReduce:  reply.NReduce,
 	}, nil
+}
+
+// reportTask reports to coordinator final status of task
+// if fails worker will wait for next task and coordinator will set failed in 10 seconds timeout
+func (w *IAmWorker) reportTask(status WorkerReport) error {
+	args := ReportArgs{
+		WiD:    w.iD,
+		Status: status,
+	}
+
+	reply := ReportReply{}
+
+	err := w.call("Coordinator.ReceiveReport", &args, &reply)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // main/mrworker.go calls this function.

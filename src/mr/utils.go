@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"hash/fnv"
 	"log/slog"
 	"os"
 )
@@ -51,4 +52,24 @@ func NewLogger(level logLevel) *slog.Logger {
 	handler := slog.NewTextHandler(os.Stdout, &opts)
 
 	return slog.New(handler)
+}
+
+// Map functions return a slice of KeyValue.
+type KeyValue struct {
+	Key   string
+	Value string
+}
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+// use ihash(key) % NReduce to choose the reduce
+// task number for each KeyValue emitted by Map.
+func ihash(key string) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32() & 0x7fffffff)
 }
