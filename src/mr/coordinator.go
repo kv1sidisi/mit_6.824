@@ -25,11 +25,12 @@ type CTask struct {
 }
 
 type Coordinator struct {
-	log *slog.Logger
-	mu  sync.Mutex
+	mu sync.Mutex
 
 	workerIDToTaskID map[int]*CTask
 	tIDtoTask        map[int]*CTask
+
+	activeWorkers int
 
 	phase   CPhase
 	nReduce int
@@ -48,8 +49,7 @@ type Coordinator struct {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		log: NewLogger(debug),
-		mu:  sync.Mutex{},
+		mu: sync.Mutex{},
 
 		workerIDToTaskID: make(map[int]*CTask),
 		tIDtoTask:        make(map[int]*CTask),
@@ -65,9 +65,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		reduceTasks: nReduce,
 	}
 
-	slog.SetDefault(c.log)
+	log := NewLogger(debug)
+	slog.SetDefault(log.With("src", "coordinator.go"))
 
 	slog.Debug("coordinator created")
+
+	slog.Debug("input params", slog.Int("nReduce", nReduce), slog.Int("num files", len(files)))
 
 	c.addTasks(files)
 
@@ -100,7 +103,12 @@ func (c *Coordinator) Done() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.phase == donePhase
+	if c.phase == donePhase && c.activeWorkers == 0 {
+		slog.Debug("-------------------coordinator finished-----------------------")
+		return c.phase == donePhase
+	}
+	return false
+
 }
 
 func (c *Coordinator) addTasks(files []string) {
@@ -139,9 +147,11 @@ func (c *Coordinator) Hello(args *EmptyArgs, reply *HelloReply) error {
 	nextID := len(c.workerIDToTaskID)
 	c.workerIDToTaskID[nextID] = nil
 
+	c.activeWorkers++
+
 	reply.ID = nextID
 
-	slog.Debug("worker registered", slog.Int("task", nextID))
+	slog.Debug("worker registered", slog.Int("WiD", nextID))
 	return nil
 }
 
@@ -154,6 +164,7 @@ func (c *Coordinator) getNextTask() *CTask {
 		task, ok = c.retryQ.Dequeue()
 	}
 	if ok {
+		slog.Debug("retry task found", slog.Int("TiD", task.iD))
 		return task
 	}
 
@@ -167,6 +178,7 @@ func (c *Coordinator) getNextTask() *CTask {
 	if !ok {
 		return nil
 	}
+	// slog.Debug("task found", slog.Any("task type", task.taskType), slog.Int("iD", task.iD))
 
 	return task
 }
@@ -177,9 +189,16 @@ func (c *Coordinator) GiveTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.phase == donePhase || c.phase == startingPhase {
+	if c.phase == startingPhase {
 		reply.WTask = Wait
-		slog.Debug("no task given, coordinator is in starting or done phase")
+		slog.Debug("no task given, coordinator is in starting")
+		return nil
+	}
+
+	if c.phase == donePhase {
+		reply.WTask = Exit
+		c.activeWorkers--
+		slog.Debug("no task given, coordinator is in done phase")
 		return nil
 	}
 
@@ -191,26 +210,28 @@ func (c *Coordinator) GiveTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		return nil
 	}
 
+	c.workerIDToTaskID[args.WiD] = task
+
 	if task.taskType == MapType {
 		reply.TiD = task.iD
 		reply.NReduce = c.nReduce
 		reply.Filename = task.filename
 		reply.WTask = Run
 		reply.TType = MapType
-		slog.Debug("map task given", slog.Int("task", task.iD))
+		slog.Debug("map task given", slog.Int("TiD", task.iD), slog.Int("WiD", args.WiD))
 		return nil
 	}
 
-	if task.taskType == MapType {
+	if task.taskType == ReduceType {
 		reply.TiD = task.iD
 		reply.NReduce = c.nReduce
 		reply.WTask = Run
 		reply.TType = ReduceType
-		slog.Debug("reduce task given %d", slog.Int("task", task.iD))
+		slog.Debug("reduce task given %d", slog.Int("TiD", task.iD), slog.Int("WiD", args.WiD))
 		return nil
 	}
 
-	slog.Debug("error getting task type")
+	slog.Debug("error getting task type", slog.Any("task type", task.taskType))
 
 	return ErrorTaskType
 }
@@ -224,28 +245,37 @@ func (c *Coordinator) GetReport(args *ReportArgs, reply *ReportReply) error {
 	id := args.WiD
 	status := args.Status
 
-	task := c.workerIDToTaskID[id]
+	task, ok := c.workerIDToTaskID[id]
+	if !ok || task == nil {
+		slog.Error("wrong worker id or task not found", slog.Int("Wid", id))
+
+	}
+
+	slog.Debug("got task report", slog.Int("TiD", task.iD))
 
 	if status == WSuccess {
 		switch task.taskType {
 		case MapType:
 			c.tasksDone++
+			slog.Debug("tasks counter", slog.Any("phase", c.phase), slog.Int("tasks left on phase", c.mapTasks-c.tasksDone))
 		case ReduceType:
 			c.tasksDone++
+			slog.Debug("tasks counter", slog.Any("phase", c.phase), slog.Int("tasks left on phase", c.reduceTasks-c.tasksDone))
 		}
-		slog.Debug("task done %d", task.iD)
+		slog.Debug("task done %d", slog.Int("TiD", task.iD))
 	} else {
 		c.retryQ.Enqueue(task)
-		slog.Debug("task %d failed, added to retryQ", task.iD)
+		slog.Debug("task %d failed, added to retryQ", slog.Int("TiD", task.iD))
 	}
 
-	if c.tasksDone == c.mapTasks {
+	if c.tasksDone == c.mapTasks && c.phase == mapPhase {
 		c.phase = reducePhase
+		c.tasksDone = 0
 		slog.Debug("coordinator switched to reduce phase")
 		return nil
 	}
 
-	if c.tasksDone == c.reduceTasks {
+	if c.tasksDone == c.reduceTasks && c.phase == reducePhase {
 		c.phase = donePhase
 		slog.Debug("coordinator switched to done phase")
 		return nil

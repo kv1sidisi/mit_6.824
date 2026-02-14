@@ -43,6 +43,7 @@ type WorkerTask string
 const (
 	Run  WorkerTask = "done"
 	Wait WorkerTask = "wait"
+	Exit WorkerTask = "exit"
 )
 
 type TaskType string

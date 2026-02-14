@@ -49,10 +49,11 @@ func makeClient(serverAddr string, port string) *rpc.Client {
 func (w *IAmWorker) call(rpcname string, args any, reply any) error {
 	err := w.c.Call(rpcname, args, reply)
 	if err != nil {
-		return nil
+		slog.Error("error rpc call", err)
+		return err
 	}
 
-	return err
+	return nil
 }
 
 // SayHello reisters worker in coordinator
@@ -85,6 +86,11 @@ func (w *IAmWorker) startWorking() error {
 			continue
 		}
 
+		if w.task == Exit {
+			slog.Debug("worker received exit signal", slog.Int("Wid", w.iD))
+			return nil
+		}
+
 		if w.task == Wait {
 			time.Sleep(time.Second)
 			continue
@@ -104,6 +110,7 @@ func (w *IAmWorker) startWorking() error {
 				slog.Any("err", err),
 			)
 		}
+
 		err = w.reportTask(WSuccess)
 		if err != nil {
 			slog.Debug("worker failed",
@@ -260,6 +267,8 @@ func (w *IAmWorker) requestTask() (WTask, error) {
 
 	w.task = reply.WTask
 
+	slog.Debug("got task", slog.Int("WiD", w.iD), slog.Int("TiD", reply.TiD))
+
 	return WTask{
 		iD:       reply.TiD,
 		taskType: reply.TType,
@@ -278,7 +287,7 @@ func (w *IAmWorker) reportTask(status WorkerReport) error {
 
 	reply := ReportReply{}
 
-	err := w.call("Coordinator.ReceiveReport", &args, &reply)
+	err := w.call("Coordinator.GetReport", &args, &reply)
 	if err != nil {
 		return err
 	}
@@ -292,10 +301,15 @@ func Worker(mapf func(string, string) []KeyValue,
 ) {
 	worker := IAmWorker{}
 	worker.c = makeClient("127.0.0.1", "1234")
+	worker.mapf = mapf
+	worker.reducef = reducef
+
+	log := NewLogger(debug)
+	slog.SetDefault(log.With("src", "worker.go"))
 
 	err := worker.sayHello()
 	if err != nil {
-		log.Fatal("couldn't get id:", err)
+		slog.Error("couldn't get id", err)
 	}
 
 	errCh := make(chan error, 1)
@@ -305,8 +319,10 @@ func Worker(mapf func(string, string) []KeyValue,
 	}()
 
 	if err := <-errCh; err != nil {
-		log.Fatal("coordinator dead")
+		slog.Error("coordinator dead")
 	}
+
+	slog.Debug("exiting", slog.Int("WiD", worker.iD))
 
 	// Your worker implementation here.
 
